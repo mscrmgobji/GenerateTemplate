@@ -1,4 +1,4 @@
-﻿using Centrix.CRM.Model;
+using Centrix.CRM.Model;
 using Centrix.Plugins.BI.Helpers;
 using Microsoft.Crm.Sdk.Messages;
 using Microsoft.Xrm.Sdk;
@@ -134,10 +134,49 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             };
 
 
+            #region 🔹 0. Pays de la liste de prix + résolution des produits additionnels (FetchXml du paramétrage)
+            EntityReference priceLevelCountryRef = null;
+
+            try
+            {
+                if (priceLevelRef == null)
+                {
+                    throw new InvalidPluginExecutionException("Le devis n'a pas de liste de prix (pricelevelid) — traitement bundle ignoré");
+                }
+                var priceLevelEntity = service.Retrieve("pricelevel", priceLevelRef.Id, new ColumnSet("ctx_countryid"));
+                priceLevelCountryRef = priceLevelEntity.GetAttributeValue<EntityReference>("ctx_countryid");
+            }
+            catch (Exception)
+            {
+                // si l'appel échoue on continue sans country (le fallback géré plus bas)
+                priceLevelCountryRef = null;
+            }
+
+            string priceLevelCountryName = priceLevelCountryRef?.Name;
+            log.Trace($"Pays de la liste de prix : {priceLevelCountryName ?? "non défini"}");
+
+            var additionalProducts = ResolveAdditionalProducts(service, ref log, priceLevelCountryName, quote.Id, priceLevelRef?.Id);
+            var additionalProductIds = new HashSet<Guid>(additionalProducts.Select(a => a.ProductId));
+            log.Trace($"Produits additionnels résolus via paramétrage : {additionalProducts.Count}");
+            #endregion
+
+
             #region 🔹 1. Récupérer les lignes de devis avec infos produit + zone Hors Bundle
+            var quoteDetailColumns = new List<string> { "productid", "extendedamount", "ctx_areacpqid", "priceperunit", "ctx_unitpriceafterdiscount", "producttypecode" };
+
+            // Ajouter les champs "valeur" déclarés dans le paramétrage des produits additionnels
+            foreach (var field in additionalProducts
+                .Select(a => a.ValueFieldName)
+                .Where(f => !string.IsNullOrWhiteSpace(f))
+                .Select(f => f.Trim().ToLowerInvariant())
+                .Distinct())
+            {
+                if (!quoteDetailColumns.Contains(field)) quoteDetailColumns.Add(field);
+            }
+
             var query = new QueryExpression("quotedetail")
             {
-                ColumnSet = new ColumnSet("productid", "extendedamount", "ctx_areacpqid", "priceperunit", "ctx_unitpriceafterdiscount", "producttypecode"),
+                ColumnSet = new ColumnSet(quoteDetailColumns.ToArray()),
                 Criteria =
     {
         Conditions =
@@ -191,55 +230,31 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                     Zone = zoneEntity.GetAttributeValue<OptionSetValue>("ctx_areanumber")?.Value,
                     Prix = Math.Round(x.GetAttributeValue<Money>("ctx_unitpriceafterdiscount")?.Value ?? 0, 2),
                     ProductTypeCode = x.GetAttributeValue<OptionSetValue>("producttypecode")?.Value,   // 2 = Bundle
-                    ProductId = x.GetAttributeValue<EntityReference>("productid")?.Id
+                    ProductId = productRef?.Id,
+                    Line = x
                 };
             }).ToList();
 
+            // 🔹 Isolation des produits additionnels : productid présent dans le résultat des FetchXml
+            var additionalProductItems = data
+                .Where(x => x.ProductId.HasValue && additionalProductIds.Contains(x.ProductId.Value))
+                .ToList();
+            log.Trace($"Lignes de devis identifiées comme produits additionnels : {additionalProductItems.Count}");
 
-            var produits = data
+            // Lignes "normales" = tout sauf les produits additionnels
+            var regularData = data
+                .Where(x => !(x.ProductId.HasValue && additionalProductIds.Contains(x.ProductId.Value)))
+                .ToList();
+
+            var produits = regularData
                 .Where(x => x.Produit != null && x.ProductTypeCode != 2) // exclure les bundles (traités séparément)
                 .Select(x => x.Produit)
                 .Distinct()
                 .ToList();
 
-
-            // Récupérer le pricelevel pour obtenir ctx_countryid (pays de la pricelist)
-            Entity priceLevelEntity = null;
-            EntityReference priceLevelCountryRef = null;
-           
-            try
-            {
-                if (priceLevelRef == null)
-                {
-                 throw new InvalidPluginExecutionException("Le devis n'a pas de liste de prix (pricelevelid) — traitement bundle ignoré");
-                }
-                priceLevelEntity = service.Retrieve("pricelevel", priceLevelRef.Id, new ColumnSet("ctx_countryid"));
-                priceLevelCountryRef = priceLevelEntity.GetAttributeValue<EntityReference>("ctx_countryid");
-            }
-            catch (Exception)
-            {
-                // si l'appel échoue on continue sans country (le fallback géré plus bas)
-                priceLevelCountryRef = null;
-            }
-         
-            // 🔹 Isolation des produits additionnels (config centralisée dans AdditionalProductsConfig.cs)
-            var additionalProductItems = data
-                .Where(x => x.Produit != null && AdditionalProductsConfig.IsAdditionalProduct(x.Produit))
-                .ToList();
-            log.Trace($"Produits additionnels trouvés : {additionalProductItems.Count}");
-
-            var productList = new List<Dictionary<string, object>>();
-
             foreach (var produit in produits)
             {
-                // ⚡ Produits additionnels : traités séparément après la création de tous les templates
-                if (AdditionalProductsConfig.IsAdditionalProduct(produit))
-                {
-                    log.Trace($"Produit '{produit}' ignoré dans la boucle principale (produit additionnel)");
-                    continue;
-                }
-
-                var items = data.Where(x => x.Produit == produit);
+                var items = regularData.Where(x => x.Produit == produit);
 
                 // ✅ contrôle doublon (Produit + Zone)
                 var duplicates = items
@@ -310,7 +325,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             #endregion
 
             #region  🔹 Traitement des bundles (producttypecode = 2)
-            var bundleLines = data.Where(x => x.ProductTypeCode == 2 && x.ProductId.HasValue).ToList();
+            var bundleLines = regularData.Where(x => x.ProductTypeCode == 2 && x.ProductId.HasValue).ToList();
             log.Trace($"Bundles trouvés : {bundleLines.Count}");
 
             if (bundleLines.Any())
@@ -380,6 +395,13 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                     {
                         var pplProductRef = ppl.GetAttributeValue<EntityReference>("productid");
                         var pplAmount = Math.Round(ppl.GetAttributeValue<Money>("amount")?.Value ?? 0, 2);
+
+                        // Produit additionnel → jamais de ligne ctx_quotetemplate
+                        if (pplProductRef != null && additionalProductIds.Contains(pplProductRef.Id))
+                        {
+                            log.Trace($"Produit '{pplProductRef.Name}' (bundle) ignoré : produit additionnel");
+                            continue;
+                        }
 
                         // Toujours calculer la zone via ctx_productareacpq -> ctx_areacpq
                         int? zoneVal = null;
@@ -485,7 +507,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                 log.Trace($"ctx_quotetemplate créé : '{template["ctx_name"]}'");
             }
 
-            #region 🔹 Traitement post-création : produits additionnels (dynamique via AdditionalProductsConfig)
+            #region 🔹 Traitement post-création : produits additionnels (FetchXml via AdditionalProductsConfig)
             if (additionalProductItems.Any())
             {
                 log.Trace($"Traitement des produits additionnels ({additionalProductItems.Count} item(s))...");
@@ -515,20 +537,29 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                     var firstTemplate = firstTemplates[0];
                     var updateEntity = new Entity("ctx_quotetemplate", firstTemplate.Id);
 
-                    // Pour chaque produit additionnel trouvé, résoudre le slot via (nom + pays du owner)
                     foreach (var item in additionalProductItems)
                     {
-                        int? slot = AdditionalProductsConfig.GetSlot(item.Produit, priceLevelCountryRef.Name);
-                        if (slot.HasValue)
+                        var match = additionalProducts.First(a => a.ProductId == item.ProductId.Value);
+                        int slot = match.AdditionalProductNum;
+
+                        if (slot < AdditionalProductsConfig.MinSlot || slot > AdditionalProductsConfig.MaxSlot)
                         {
-                            updateEntity[$"ctx_additionalproduct{slot.Value}name"] = item.Produit;
-                            updateEntity[$"ctx_additionalproduct{slot.Value}price"] = new Money(item.Prix);
-                            log.Trace($"Slot {slot.Value} → '{item.Produit}' = {item.Prix} (pays: {priceLevelCountryRef.Id})");
+                            log.Trace($"Produit '{item.Produit}' : slot {slot} hors plage [{AdditionalProductsConfig.MinSlot}-{AdditionalProductsConfig.MaxSlot}] — ignoré");
+                            continue;
                         }
-                        else
+
+                        string nameField = AdditionalProductsConfig.GetNameField(slot);
+                        string valueField = AdditionalProductsConfig.GetValueField(slot);
+                        string value = GetFieldValueAsText(item.Line, match.ValueFieldName);
+
+                        if (updateEntity.Contains(nameField))
                         {
-                            log.Trace($"Produit '{item.Produit}' : aucune règle ne correspond pour le pays '{priceLevelCountryRef.Name}' — ignoré");
+                            log.Trace($"⚠️ Slot {slot} déjà rempli par '{updateEntity[nameField]}' — écrasé par '{item.Produit}'");
                         }
+
+                        updateEntity[nameField] = item.Produit;
+                        updateEntity[valueField] = value;
+                        log.Trace($"Slot {slot} → '{item.Produit}' = '{value}' (champ source : {match.ValueFieldName})");
                     }
 
                     service.Update(updateEntity);
@@ -542,6 +573,106 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             #endregion
 
             log.Trace("-----------------Finish GenerateQuoteMatrixJson -----------------");
+        }
+
+        /// <summary>
+        /// Exécute les FetchXml du paramétrage applicables au pays de la liste de prix
+        /// et retourne la liste (GUID produit, N° de slot, champ valeur).
+        /// </summary>
+        private static List<AdditionalProductMatch> ResolveAdditionalProducts(IOrganizationService service, ref TraceLogger log, string countryName, Guid quoteId, Guid? priceLevelId)
+        {
+            var result = new List<AdditionalProductMatch>();
+            var rules = AdditionalProductsConfig.GetRulesForCountry(countryName);
+            log.Trace($"Règles produits additionnels applicables (pays '{countryName ?? "non défini"}') : {rules.Count}");
+
+            foreach (var rule in rules)
+            {
+                if (string.IsNullOrWhiteSpace(rule.FetchXml))
+                {
+                    log.Trace($"Règle slot {rule.AdditionalProductNum} : FetchXml vide — ignorée");
+                    continue;
+                }
+
+                var fetchXml = rule.FetchXml
+                    .Replace("{quoteid}", quoteId.ToString())
+                    .Replace("{pricelevelid}", priceLevelId?.ToString() ?? Guid.Empty.ToString());
+
+                EntityCollection records;
+                try
+                {
+                    records = service.RetrieveMultiple(new FetchExpression(fetchXml));
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidPluginExecutionException(
+                        $"FetchXml invalide pour le produit additionnel {rule.AdditionalProductNum} (pays '{rule.Country}') : {ex.Message}");
+                }
+
+                log.Trace($"Règle slot {rule.AdditionalProductNum} : {records.Entities.Count} résultat(s)");
+
+                foreach (var record in records.Entities)
+                {
+                    var productId = GetProductId(record);
+                    if (!productId.HasValue)
+                    {
+                        log.Trace($"Règle slot {rule.AdditionalProductNum} : résultat '{record.LogicalName}' sans productid — ignoré");
+                        continue;
+                    }
+
+                    if (result.Any(r => r.ProductId == productId.Value))
+                    {
+                        log.Trace($"Produit {productId.Value} déjà associé à un slot — règle slot {rule.AdditionalProductNum} ignorée pour ce produit");
+                        continue;
+                    }
+
+                    result.Add(new AdditionalProductMatch
+                    {
+                        ProductId = productId.Value,
+                        AdditionalProductNum = rule.AdditionalProductNum,
+                        ValueFieldName = rule.ValueFieldName
+                    });
+                    log.Trace($"Produit additionnel : {productId.Value} → slot {rule.AdditionalProductNum}");
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>GUID du produit : Id si l'entité est un product, sinon l'attribut productid.</summary>
+        private static Guid? GetProductId(Entity record)
+        {
+            if (record.LogicalName == "product") return record.Id;
+
+            if (record.Contains("productid"))
+            {
+                var raw = record["productid"];
+                if (raw is AliasedValue aliased) raw = aliased.Value;
+                if (raw is EntityReference er) return er.Id;
+                if (raw is Guid g) return g;
+            }
+            return null;
+        }
+
+        /// <summary>Convertit la valeur d'un champ du quotedetail en texte (pour ctx_additionalproductNvalue).</summary>
+        private static string GetFieldValueAsText(Entity line, string fieldName)
+        {
+            if (line == null || string.IsNullOrWhiteSpace(fieldName)) return null;
+            fieldName = fieldName.Trim().ToLowerInvariant();
+            if (!line.Contains(fieldName) || line[fieldName] == null) return null;
+
+            var raw = line[fieldName];
+            if (raw is AliasedValue aliased) raw = aliased.Value;
+
+            switch (raw)
+            {
+                case Money m:           return Math.Round(m.Value, 2).ToString();
+                case decimal d:         return Math.Round(d, 2).ToString();
+                case double db:         return Math.Round(db, 2).ToString();
+                case OptionSetValue o:  return line.FormattedValues.ContainsKey(fieldName) ? line.FormattedValues[fieldName] : o.Value.ToString();
+                case EntityReference r: return r.Name ?? r.Id.ToString();
+                case bool b:            return line.FormattedValues.ContainsKey(fieldName) ? line.FormattedValues[fieldName] : b.ToString();
+                default:                return raw.ToString();
+            }
         }
 
     }
