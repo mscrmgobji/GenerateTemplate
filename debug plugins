@@ -1,31 +1,22 @@
-log.Trace($"Message={pluginContext.MessageName} | Stage={pluginContext.Stage} | Depth={pluginContext.Depth} | CorrelationId={pluginContext.CorrelationId}");
-var parent = pluginContext.ParentContext;
-int lvl = 1;
-while (parent != null)
-{
-    log.Trace($"  Parent[{lvl}] Message={parent.MessageName} | Entity={parent.PrimaryEntityName} | Id={parent.PrimaryEntityId} | Depth={parent.Depth}");
-    parent = parent.ParentContext;
-    lvl++;
-}
-log.Trace($"Target attributes: {string.Join(", ", ((Entity)pluginContext.InputParameters["Target"]).Attributes.Keys)}");
-
-Si l'hypothèse est la bonne, vous verrez :
-
-à depth 2 : un Parent[1] avec Message=Update, sur le même devis ;
-les deux exécutions avec le même CorrelationId ;
-à depth 1 : aucun parent.
-
-Solution si c'est bien la cause
-
-N'utilisez pas if (Depth > 1) return; : ce test bloquerait aussi les appels légitimes venant d'autres plugins ou de workflows. Il vaut mieux ignorer uniquement l'Update interne :
-
-csharp
-var p = pluginContext.ParentContext;
-if (p != null
-    && p.MessageName == "Update"
-    && p.PrimaryEntityName == "quote"
-    && p.PrimaryEntityId == pluginContext.PrimaryEntityId)
-{
-    log.Trace("Update interne (SetState) sur le même devis — ignoré, traité par l'exécution parente");
-    return;
-}
+2	- Check If CPQ MODE By Entity
+	00:00:00.02 - Target Quote Id: 5029f312-43bb-f111-aaaf-70a8a52d83f6
+	00:00:00.02 - PriceLevelidRef from PostImage : e599c41a-a27a-f111-ab0e-6045bd8b13f9
+	00:00:00.02 - Message=Update | Stage=40 | Depth=2 | CorrelationId=6cf20038-c319-4ecb-a793-4b3f7b962185
+	00:00:00.02 -   Parent[1] Message=Update | Entity=quote | Id=5029f312-43bb-f111-aaaf-70a8a52d83f6 | Depth=2
+	00:00:00.02 -   Parent[2] Message=Update | Entity=none | Id=5029f312-43bb-f111-aaaf-70a8a52d83f6 | Depth=2
+	00:00:00.02 - Target attributes: modifiedby, statecode, ctx_quoteactivationdate, effectiveto, modifiedonbehalfby, timezoneruleversionnumber, quoteid, ctx_offerexpirationdate, statuscode, ctx_mainquotestag, modifiedon
+	00:00:00.02 - Update interne (SetState) sur le même devis — ignoré, traité par l'exécution parente
+	00:00:00.02 - Finish GenerateTemplateDynamicStructure..
+	00:00:00.02 - End of PostUpdateAsync
+	
+	
+1	Check If CPQ MODE By Entity
+	00:00:00.13 - Target Quote Id: 5029f312-43bb-f111-aaaf-70a8a52d83f6
+	00:00:00.13 - PriceLevelidRef from PostImage : e599c41a-a27a-f111-ab0e-6045bd8b13f9
+	00:00:00.13 - Message=Update | Stage=40 | Depth=1 | CorrelationId=6cf20038-c319-4ecb-a793-4b3f7b962185
+	00:00:00.13 -   Parent[1] Message=Update | Entity=quote | Id=5029f312-43bb-f111-aaaf-70a8a52d83f6 | Depth=1
+	00:00:00.13 -   Parent[2] Message=Update | Entity=none | Id=5029f312-43bb-f111-aaaf-70a8a52d83f6 | Depth=1
+	00:00:00.13 - Target attributes: statecode, statuscode, ctx_mainquotestag, quoteid, modifiedon, modifiedby, modifiedonbehalfby, ctx_quoteactivationdate, effectiveto, ctx_offerexpirationdate
+	00:00:00.13 - Update interne (SetState) sur le même devis — ignoré, traité par l'exécution parente
+	00:00:00.13 - Finish GenerateTemplateDynamicStructure..
+	00:00:00.13 - End of PostUpdateAsync
