@@ -1,90 +1,35 @@
 using Centrix.CRM.Model;
-using Centrix.Plugins.BI.Helpers;
-using Microsoft.Crm.Sdk.Messages;
+using Centrix.Plugins.BI.Quote.QuoteHandler;
+using CentrixBI_OneShot.DataMigration;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Messages;
 using Microsoft.Xrm.Sdk.Metadata;
 using Microsoft.Xrm.Sdk.Query;
-using Newtonsoft.Json;
+using Microsoft.Xrm.Tooling.Connector;
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-using System.Runtime.Remoting.Contexts;
-using System.Text.RegularExpressions;
-using System.Windows.Controls;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web.Services.Description;
 
-namespace Centrix.Plugins.BI.Quote.QuoteHandler
+namespace CentrixBI_OneShot.QuoteTemplate
 {
-    public static class GenerateTemplateDynamicStructure
-    {
-        public static void ExecuteOnUpdate(IOrganizationService service, ref TraceLogger log, IPluginExecutionContext pluginContext)
+    public static class GenerateTemplateDynamicsStrucutre
+    { 
+        public static Guid quoteid = new Guid("3cd02ed3-13bc-f111-aaad-6045bd993db4");
+        public static void Execute(CrmServiceClient service, ref TraceLogger log)
         {
             log.Trace("----------------- GenerateTemplateDynamicStructure -----------------");
-
-
+            Quote quote = service.Retrieve("quote", quoteid, new ColumnSet(true)).ToEntity<Quote>();
             try
             {
-                if (!pluginContext.InputParameters.Contains("Target"))
-                {
-                    log.Trace("Missing Target Parameter");
-                    throw new InvalidPluginExecutionException("Missing Target Parameter");
-                }
 
-                var Target = pluginContext.InputParameters["Target"] as Entity;
-
-                Centrix.CRM.Model.Quote quote = Target.ToEntity<Centrix.CRM.Model.Quote>();
-
-                if (Target == null)
-                {
-                    log.Trace("Target Parameter is null");
-                    throw new InvalidPluginExecutionException("Target Parameter is null");
-                }
-
-                foreach (var attr in quote.Attributes)
-                {
-                    log.Trace($"Quote Attribute: {attr.Key} ---- Quote Attribute Value : {attr.Value}");
-                }
-                if (!quote.Contains(Centrix.CRM.Model.Quote.Fields.StateCode))
-                {
-                    log.Trace("Missing StateCode");
-                    return;
-                }
-
-                if(quote.StateCode != null && quote.StateCode.Value != Centrix.CRM.Model.Quote_StateCode.Active)
-                {
-                    log.Trace($"Quote State is not Active : {quote.StateCode.Value}");
-                    return;
-                }
-
-                if (Target.LogicalName != CRM.Model.Quote.EntityLogicalName)
-                {
-                    log.Trace("Target entity is not quote");
-                    throw new InvalidPluginExecutionException("Target entity is not quote");
-                }
-
-                if (!Utility.isCpqMode(service, Target.ToEntityReference(), ref log))
-                {
-                    log.Trace("CPQ Mode is not active.");
-                    return;
-                }
-
-
-
-                log.Trace($"Target Quote Id: {Target.Id}");
-
-                // Récupérer l'ownerRef depuis le PostImage (évite un Retrieve supplémentaire)
-                EntityReference priceLevelRef = null;
-                if (pluginContext.PostEntityImages.Contains("PostImage"))
-                {
-                    var postImage = pluginContext.PostEntityImages["PostImage"];
-                    priceLevelRef = postImage?.GetAttributeValue<EntityReference>("pricelevelid");
-                }
-                log.Trace($"PriceLevelidRef from PostImage : {priceLevelRef?.Id.ToString() ?? "non disponible"}");
-
-                GenerateQuoteMatrixJson(service, ref log, Target, priceLevelRef);
-
+                EntityReference PriceLevelId = quote.PriceLevelId;
+                Console.WriteLine("Execute Old/New Function ? 1/2");
+                GenerateQuoteMatrixJson(service, ref log, quote, PriceLevelId);
+                //  
             }
             catch (Exception ex)
             {
@@ -519,9 +464,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             }
 
             #region 🔹 Traitement post-création : produits additionnels (via AdditionalProductsConfig)
-            // Exécuté dès qu'il existe des règles pour le pays : même sans produit trouvé,
-            // les slots de type Currency doivent recevoir "- €"
-            if (additionalProductItems.Any() || additionalRules.Any())
+            if (additionalProductItems.Any())
             {
                 log.Trace($"Traitement des produits additionnels ({additionalProductItems.Count} item(s))...");
 
@@ -594,46 +537,8 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                         log.Trace($"Slot {slot} → '{item.LineProductName}' = '{value}' (champ source : {match.ValueFieldName})");
                     }
 
-                    // 🔹 Slots sans produit trouvé : si le champ valeur paramétré est de type Currency → "- €"
-                    foreach (var slotGroup in additionalRules.GroupBy(r => r.Rule.AdditionalProductNum))
-                    {
-                        int slot = slotGroup.Key;
-                        if (slot < AdditionalProductsConfig.MinSlot || slot > AdditionalProductsConfig.MaxSlot) continue;
-
-                        string valueField = AdditionalProductsConfig.GetValueField(slot);
-                        if (updateEntity.Contains(valueField)) continue; // un produit a déjà rempli ce slot
-
-                        bool isCurrencySlot = false;
-                        foreach (var r in slotGroup)
-                        {
-                            if (IsCurrencyField(service, ref log, null, r.Rule.ValueFieldName, moneyFieldCache))
-                            {
-                                isCurrencySlot = true;
-                                break;
-                            }
-                        }
-
-                        if (!isCurrencySlot)
-                        {
-                            log.Trace($"Slot {slot} : aucun produit trouvé, champ non Currency — laissé vide");
-                            continue;
-                        }
-
-                        if (!currencySymbolLoaded)
-                        {
-                            currencySymbol = GetQuoteCurrencySymbol(service, ref log, quote.Id);
-                            currencySymbolLoaded = true;
-                        }
-
-                        updateEntity[valueField] = FormatCurrencyValue(null, null, currencySymbol); // "- €"
-                        log.Trace($"Slot {slot} : aucun produit trouvé → '{updateEntity[valueField]}'");
-                    }
-
-                    if (updateEntity.Attributes.Count > 0)
-                    {
-                        service.Update(updateEntity);
-                        log.Trace($"Produits additionnels mis à jour sur ctx_quotetemplate {firstTemplate.Id}");
-                    }
+                    service.Update(updateEntity);
+                    log.Trace($"Produits additionnels mis à jour sur ctx_quotetemplate {firstTemplate.Id}");
                 }
                 else
                 {
@@ -820,13 +725,13 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
 
             switch (raw)
             {
-                case Money m:           return Math.Round(m.Value, 2).ToString();
-                case decimal d:         return Math.Round(d, 2).ToString();
-                case double db:         return Math.Round(db, 2).ToString();
-                case OptionSetValue o:  return line.FormattedValues.ContainsKey(fieldName) ? line.FormattedValues[fieldName] : o.Value.ToString();
+                case Money m: return Math.Round(m.Value, 2).ToString();
+                case decimal d: return Math.Round(d, 2).ToString();
+                case double db: return Math.Round(db, 2).ToString();
+                case OptionSetValue o: return line.FormattedValues.ContainsKey(fieldName) ? line.FormattedValues[fieldName] : o.Value.ToString();
                 case EntityReference r: return r.Name ?? r.Id.ToString();
-                case bool b:            return line.FormattedValues.ContainsKey(fieldName) ? line.FormattedValues[fieldName] : b.ToString();
-                default:                return raw.ToString();
+                case bool b: return line.FormattedValues.ContainsKey(fieldName) ? line.FormattedValues[fieldName] : b.ToString();
+                default: return raw.ToString();
             }
         }
 
