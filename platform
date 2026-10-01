@@ -1,0 +1,20 @@
+var query = new QueryExpression("quotedetail");
+query.ColumnSet.AddColumns(
+    "ctx_areacpqid",
+    "ctx_unitpriceafterdiscount",
+    "extendedamount",
+    "priceperunit",
+    "productid",
+    "productname",
+    "producttypecode");
+var query_And1 = new FilterExpression();
+query.Criteria.AddFilter(query_And1);
+query_And1.AddCondition("producttypecode", ConditionOperator.NotIn, 3, 4);
+query_And1.AddCondition("quoteid", ConditionOperator.Equal, quote.Id);
+var query_And2 = new FilterExpression();
+query.Criteria.AddFilter(query_And2);
+var query_product = query.AddLink("product", "productid", "productid");
+query_product.EntityAlias = "product";
+var query_product_product = query_product.AddLink("product", "parentproductid", "productid");
+query_product_product.EntityAlias = "familyproduct";
+query_product_product.Columns.AddColumns("ctx_platformlist", "name");
