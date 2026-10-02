@@ -36,7 +36,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
         /// <summary>Nom logique du champ du quotedetail dont la valeur est copiée dans ctx_additionalproduct{N}value.</summary>
         public string ValueFieldName { get; set; }
 
-        public bool HasNameCriteria  => ProductNames != null && ProductNames.Any(n => !string.IsNullOrWhiteSpace(n));
+        public bool HasNameCriteria => ProductNames != null && ProductNames.Any(n => !string.IsNullOrWhiteSpace(n));
         public bool HasFetchCriteria => !string.IsNullOrWhiteSpace(FetchXml);
 
         public bool MatchesProductName(string productName)
@@ -62,7 +62,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
     public static class AdditionalProductsConfig
     {
         // ⚠️ À vérifier : orthographe exacte des champs dans Dataverse (additional vs additionnal)
-        public const string NameFieldFormat  = "ctx_additionalproduct{0}name";
+        public const string NameFieldFormat = "ctx_additionalproduct{0}name";
         public const string ValueFieldFormat = "ctx_additionalproduct{0}value";
 
         public const int MinSlot = 1;
@@ -70,37 +70,62 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
 
         public static readonly List<AdditionalProductRule> Rules = new List<AdditionalProductRule>
         {
-            // ── Cas simple : nom du produit (aucune requête serveur) ──
+            // ── Cas avancé : requête FetchXml ──
             new AdditionalProductRule
             {
                 AdditionalProductNum = 1,
                 Country              = "France",
-                ProductNames         = new List<string> { "Expert Insight" },
-                ValueFieldName       = "ctx_unitpriceafterdiscount"
+                ValueFieldName       = "extendedamount",
+                FetchXml             =
+                  @"<fetch>
+                  <entity name='quotedetail'>
+                    <filter />
+                    <link-entity name='product' from='productid' to='productid' link-type='inner'>
+                      <link-entity name='product' from='productid' to='parentproductid'>
+                        <filter>
+                          <condition attribute='name' operator='eq' value='License' />
+                        </filter>
+                      </link-entity>
+                    </link-entity>
+                  </entity>
+                </fetch>"
             },
-
-            // ── Cas avancé : requête FetchXml ──
+             // ── Cas avancé : requête FetchXml ──
             new AdditionalProductRule
             {
                 AdditionalProductNum = 2,
                 Country              = "France",
-                ValueFieldName       = "ctx_unitpriceafterdiscount",
+                ValueFieldName       = "extendedamount",
                 FetchXml             =
-                    "<fetch top=\"1\">" +
-                    "  <entity name=\"quotedetail\">" +
-                    "    <filter>" +
-                    "      <condition attribute=\"productid\" operator=\"eq\" value=\"30ad38f2-015e-f111-a826-002248a26111\" />" +
-                    "    </filter>" +
-                    "    <link-entity name=\"product\" from=\"productid\" to=\"productid\" link-type=\"inner\">" +
-                    "      <link-entity name=\"product\" from=\"productid\" to=\"parentproductid\">" +
-                    "        <filter>" +
-                    "          <condition attribute=\"name\" operator=\"eq\" value=\"License\" />" +
-                    "        </filter>" +
-                    "      </link-entity>" +
-                    "    </link-entity>" +
-                    "  </entity>" +
-                    "</fetch>"
+                  @"<fetch>
+                  <entity name='quotedetail'>
+                    <filter />
+                    <link-entity name='product' from='productid' to='productid' link-type='inner'>
+                      <link-entity name='product' from='productid' to='parentproductid'>
+                        <filter>
+                          <condition attribute='name' operator='eq' value='Ongoing Screening Names' />
+                        </filter>
+                      </link-entity>
+                    </link-entity>
+                  </entity>
+                </fetch>"
             },
+            // ── Cas simple : nom du produit (aucune requête serveur) ──
+            new AdditionalProductRule
+            {
+                AdditionalProductNum = 3,
+                Country              = "France",
+                ProductNames         = new List<string> { "Expert Insight"},
+                ValueFieldName       = "extendedamount"
+            },
+             new AdditionalProductRule
+            {
+                AdditionalProductNum = 4,
+                Country              = "France",
+                ProductNames         = new List<string> { "Economic Insight"},
+                ValueFieldName       = "extendedamount"
+            }
+
         };
 
         /// <summary>Règles applicables au pays de la liste de prix (les règles sans pays s'appliquent partout), dans l'ordre déclaré.</summary>
@@ -112,7 +137,8 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                 .ToList();
         }
 
-        public static string GetNameField(int slot)  => string.Format(NameFieldFormat, slot);
+        public static string GetNameField(int slot) => string.Format(NameFieldFormat, slot);
         public static string GetValueField(int slot) => string.Format(ValueFieldFormat, slot);
+
     }
 }
