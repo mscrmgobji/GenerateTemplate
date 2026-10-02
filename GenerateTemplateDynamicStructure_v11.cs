@@ -1,42 +1,100 @@
 using Centrix.CRM.Model;
-using Centrix.Plugins.BI.Quote.QuoteHandler;
-using CentrixBI_OneShot.DataMigration;
+using Centrix.Plugins.BI.Helpers;
+using Microsoft.Crm.Sdk.Messages;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Messages;
 using Microsoft.Xrm.Sdk.Metadata;
 using Microsoft.Xrm.Sdk.Query;
-using Microsoft.Xrm.Tooling.Connector;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Web.Services.Description;
+using System.Runtime.Remoting.Contexts;
+using System.Text.RegularExpressions;
+using System.Windows.Controls;
 
-namespace CentrixBI_OneShot.QuoteTemplate
+namespace Centrix.Plugins.BI.Quote.QuoteHandler
 {
-    public static class GenerateTemplateDynamicsStrucutre
-    { 
-        private const string FamilyAlias = "familyproduct";
-
-        public static Guid quoteid = new Guid("3cd02ed3-13bc-f111-aaad-6045bd993db4");
-        public static void Execute(CrmServiceClient service, ref TraceLogger log)
+    public static class GenerateTemplateDynamicStructure
+    {
+        public static void ExecuteOnUpdate(IOrganizationService service, ref TraceLogger log, IPluginExecutionContext pluginContext)
         {
             log.Trace("----------------- GenerateTemplateDynamicStructure -----------------");
+           
+            
+            if (!pluginContext.InputParameters.Contains("Target"))
+            {
+                log.Trace("Missing Target Parameter");
+                throw new InvalidPluginExecutionException("Missing Target Parameter");
+            }
+
+            var Target = pluginContext.InputParameters["Target"] as Entity;
+
             try
             {
-                Quote quote = service.Retrieve("quote", quoteid, new ColumnSet(true)).ToEntity<Quote>();
-                EntityReference PriceLevelId = quote.PriceLevelId;
-                Console.WriteLine("Execute Old/New Function ? 1/2");
-                GenerateQuoteMatrixJson(service, ref log, quote, PriceLevelId);
-                //  
+                log.Trace($"Plugin depth : {pluginContext.Depth}");
+                //if (pluginContext.Depth > 1)
+                //{
+                //    log.Trace($"Plugin depth > 1 ({pluginContext.Depth}) → exit");
+                //    return;
+                //}
+
+              
+
+
+                if (Target == null)
+                {
+                    log.Trace("Target Parameter is null");
+                    throw new InvalidPluginExecutionException("Target Parameter is null");
+                }
+
+                Centrix.CRM.Model.Quote quote = Target.ToEntity<Centrix.CRM.Model.Quote>();
+
+                if (Target.LogicalName != CRM.Model.Quote.EntityLogicalName)
+                {
+                    log.Trace("Target entity is not quote");
+                    throw new InvalidPluginExecutionException("Target entity is not quote");
+                }
+
+                if (!Utility.isCpqMode(service, Target.ToEntityReference(), ref log))
+                {
+                    log.Trace("CPQ Mode is not active.");
+                    return;
+                }
+                if (!quote.Contains(Centrix.CRM.Model.Quote.Fields.StateCode))
+                {
+                    log.Trace("Missing StateCode");
+                    return;
+                }
+
+                if(quote.StateCode != null && quote.StateCode.Value != Centrix.CRM.Model.Quote_StateCode.Active)
+                {
+                    log.Trace($"Quote State is not Active : {quote.StateCode.Value}");
+                    return;
+                }
+
+
+                log.Trace($"Target Quote Id: {Target.Id}");
+
+                // Récupérer l'ownerRef depuis le PostImage (évite un Retrieve supplémentaire)
+                EntityReference priceLevelRef = null;
+                if (pluginContext.PostEntityImages.Contains("PostImage"))
+                {
+                    var postImage = pluginContext.PostEntityImages["PostImage"];
+                    priceLevelRef = postImage?.GetAttributeValue<EntityReference>("pricelevelid");
+                }
+                log.Trace($"PriceLevelidRef from PostImage : {priceLevelRef?.Id.ToString() ?? "non disponible"}");
+
+                GenerateQuoteMatrixJson(service, ref log, Target, priceLevelRef);
+
             }
             catch (Exception ex)
             {
                 // Toute exception (y compris hors GenerateQuoteMatrixJson) → quote template d'erreur, sans bloquer l'utilisateur
                 log.Trace($"An unexpected error occurred in the plugin GenerateTemplateDynamicStructure : {ex.Message}");
-                HandleException(service, ref log, quoteid, ex);
+                HandleException(service, ref log, Target.Id, ex);
             }
             finally
             {
@@ -186,7 +244,7 @@ namespace CentrixBI_OneShot.QuoteTemplate
             // product → produit parent / famille (alias "familyproduct")
             // LeftOuter : on garde les produits sans parent (bundles, produits additionnels…)
             var query_product_product = query_product.AddLink("product", "parentproductid", "productid", JoinOperator.LeftOuter);
-            query_product_product.EntityAlias = FamilyAlias;
+            query_product_product.EntityAlias = "familyproduct";
             query_product_product.Columns.AddColumns(QuoteTemplateFields.ProductPlatformList, "name");
 
 
@@ -204,7 +262,7 @@ namespace CentrixBI_OneShot.QuoteTemplate
                 if (string.IsNullOrWhiteSpace(lineProductName)) lineProductName = productName;
 
                 // Produit parent = familyproduct.name (null si le produit n'a pas de parent)
-                string parentName = GetAliasedValue<string>(x, FamilyAlias + ".name");
+                string parentName = GetAliasedValue<string>(x, "familyproduct.name");
                 if (string.IsNullOrWhiteSpace(parentName)) parentName = null;
 
                 Entity zoneEntity = new Entity();
@@ -224,7 +282,7 @@ namespace CentrixBI_OneShot.QuoteTemplate
                     ProductId = productRef?.Id,
                     Line = x,
                     LineProductName = lineProductName, // quotedetail.productname (sinon nom du produit lié)
-                    Family = GetMultiSelectLabel(x, FamilyAlias + "." + QuoteTemplateFields.ProductPlatformList), // libellé ctx_platformlist du produit parent (null si absent)
+                    Platfrom = GetMultiSelectLabel(x, "familyproduct." + QuoteTemplateFields.ProductPlatformList), // libellé ctx_platformlist du produit parent (null si absent)
                     AdditionalRule = FindAdditionalRule(productRef?.Id, lineProductName)
                 };
             }).ToList();
@@ -268,7 +326,7 @@ namespace CentrixBI_OneShot.QuoteTemplate
                 entity["ctx_name"] = produit;
 
                 // Famille de produit = libellé(s) ctx_platformlist des produits de la ligne
-                foreach (var item in items) AddProductFamily(entity, item.Family);
+                foreach (var item in items) AddProductFamily(entity, item.Platfrom);
 
                 // ✅ liaison au devis
                 entity["ctx_quoteid"] = new EntityReference("quote", quote.Id);
@@ -957,8 +1015,8 @@ namespace CentrixBI_OneShot.QuoteTemplate
         public const string ErrorMessageField = "ctx_errormessage";
         public const int ErrorMessageMaxLength = 4000;
 
-        public const string DoublonProduitZone            = "Duplicate product / zone";
-        public const string ListePrixManquante            = "Missing price list";
+        public const string DoublonProduitZone = "Duplicate product / zone";
+        public const string ListePrixManquante = "Missing price list";
         public const string ParametrageProduitAdditionnel = "Invalid additional product configuration";
     }
 
