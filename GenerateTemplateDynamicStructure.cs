@@ -1,4 +1,4 @@
-﻿using Centrix.CRM.Model;
+﻿﻿using Centrix.CRM.Model;
 using Centrix.Plugins.BI.Helpers;
 using Microsoft.Crm.Sdk.Messages;
 using Microsoft.Xrm.Sdk;
@@ -35,14 +35,6 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             try
             {
                 log.Trace($"Plugin depth : {pluginContext.Depth}");
-                //if (pluginContext.Depth > 1)
-                //{
-                //    log.Trace($"Plugin depth > 1 ({pluginContext.Depth}) → exit");
-                //    return;
-                //}
-
-              
-
 
                 if (Target == null)
                 {
@@ -152,6 +144,9 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             log.Trace("-----------------start GenerateQuoteMatrixJson -----------------");
             List<Entity> quoteTemplateList = new List<Entity>();
 
+            // Templates créés par le traitement des bundles : exclus du contrôle doublon
+            var bundleTemplates = new HashSet<Entity>();
+
             #region 🔥 SUPPRESSION des anciennes lignes de template
             var deleteQuery = new QueryExpression("ctx_quotetemplate")
             {
@@ -216,7 +211,8 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
 
 
             #region 🔹 1. Récupérer les lignes de devis avec infos produit + zone Hors Bundle
-            var quoteDetailColumns = new List<string> { "productid", "productname", "extendedamount", "ctx_areacpqid", "priceperunit", "ctx_unitpriceafterdiscount", "producttypecode" };
+            var quoteDetailColumns = new List<string> { "productid", "productname", "extendedamount", "ctx_areacpqid", "priceperunit", "ctx_unitpriceafterdiscount", "producttypecode",
+                "isproductoverridden", "productdescription" }; // produits hors catalogue
 
             // Ajouter les champs "valeur" déclarés dans le paramétrage des produits additionnels
             foreach (var field in additionalRules
@@ -245,7 +241,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             // LeftOuter : on garde les produits sans parent (bundles, produits additionnels…)
             var query_product_product = query_product.AddLink("product", "parentproductid", "productid", JoinOperator.LeftOuter);
             query_product_product.EntityAlias = "familyproduct";
-            query_product_product.Columns.AddColumns(QuoteTemplateFields.ProductPlatformList, "name");
+            query_product_product.Columns.AddColumns(QuoteTemplateFields.ProductPlatformList, "name", "productid");
 
 
             var lines = service.RetrieveMultiple(query).Entities;
@@ -262,8 +258,12 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                 if (string.IsNullOrWhiteSpace(lineProductName)) lineProductName = productName;
 
                 // Produit parent = familyproduct.name (null si le produit n'a pas de parent)
+
                 string parentName = GetAliasedValue<string>(x, "familyproduct.name");
                 if (string.IsNullOrWhiteSpace(parentName)) parentName = null;
+
+                Guid? parentId = GetAliasedValue<Guid?>(x, "familyproduct.productid");
+               
 
                 Entity zoneEntity = new Entity();
 
@@ -276,6 +276,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                 return new
                 {
                     Produit = parentName ?? productName, // ✅ clé métier
+                    ParentProductId=parentId,
                     Zone = zoneEntity?.GetAttributeValue<OptionSetValue>("ctx_areanumber")?.Value,
                     Prix = Math.Round(x.GetAttributeValue<Money>("ctx_unitpriceafterdiscount")?.Value ?? 0, 2),
                     ProductTypeCode = x.GetAttributeValue<OptionSetValue>("producttypecode")?.Value,   // 2 = Bundle
@@ -283,19 +284,27 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                     Line = x,
                     LineProductName = lineProductName, // quotedetail.productname (sinon nom du produit lié)
                     Platfrom = GetMultiSelectLabel(x, "familyproduct." + QuoteTemplateFields.ProductPlatformList), // libellé ctx_platformlist du produit parent (null si absent)
+                    IsWriteIn = x.GetAttributeValue<bool?>("isproductoverridden") == true,     // produit hors catalogue
+                    ProductDescription = x.GetAttributeValue<string>("productdescription"),   // nom du produit hors catalogue
                     AdditionalRule = FindAdditionalRule(productRef?.Id, lineProductName)
                 };
             }).ToList();
 
+            // 🔹 Produits hors catalogue (isproductoverridden = true) : traités séparément (voir plus bas)
+            var writeInItems = data
+                .Where(x => x.IsWriteIn)
+                .ToList();
+            log.Trace($"Lignes de devis hors catalogue : {writeInItems.Count}");
+
             // 🔹 Isolation des produits additionnels : nom du produit OU productid présent dans le résultat d'un FetchXml
             var additionalProductItems = data
-                .Where(x => x.AdditionalRule != null)
+                .Where(x => !x.IsWriteIn && x.AdditionalRule != null)
                 .ToList();
             log.Trace($"Lignes de devis identifiées comme produits additionnels : {additionalProductItems.Count}");
 
             // Lignes "normales" = tout sauf les produits additionnels
             var regularData = data
-                .Where(x => x.AdditionalRule == null)
+                .Where(x => !x.IsWriteIn && x.AdditionalRule == null)
                 .ToList();
 
             var produits = regularData
@@ -333,6 +342,16 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
 
                 foreach (var item in items)
                 {
+
+                    if (item.ParentProductId != null)
+                    {
+                        Guid parentProductId=item.ParentProductId.Value;
+                        entity["ctx_productcountryname"] =ProductTranslation.GetProductTranslationName(service, priceLevelCountryRef.Id, parentProductId, log)?.GetAttributeValue<string>("ctx_name");
+                        log.Trace($"Processed parent product ID: {parentProductId}");
+
+                    }
+
+
                     switch (item.Zone)
                     {
                         case 961410000:
@@ -577,6 +596,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                         {
                             templateEntity = new Entity("ctx_quotetemplate");
                             templateEntity["ctx_name"] = bundleProductName; // nom du produit parent
+                            templateEntity["ctx_productcountryname"] = ProductTranslation.GetProductTranslationName(service, priceLevelCountryRef.Id, pplProductRef.Id, log)?.GetAttributeValue<string>("ctx_name");
                             templateEntity["ctx_quoteid"] = new EntityReference("quote", quote.Id);
                         }
                         else if (templateEntity.Contains(zoneField))
@@ -594,6 +614,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                         if (isNewTemplate)
                         {
                             quoteTemplateList.Add(templateEntity);
+                            bundleTemplates.Add(templateEntity);
                             log.Trace($"ctx_quotetemplate créé (bundle) : '{bundleProductName}' — produit '{pplProductRef?.Name}' — {zoneField}={pplAmount}");
                         }
                         else
@@ -608,7 +629,9 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
 
             #region ✅ contrôle doublon (Produit + Zone)
 
+            // Pas de contrôle doublon sur les produits bundles
             var duplicatesBundles = quoteTemplateList
+                .Where(x => !bundleTemplates.Contains(x))
                 .GroupBy(x => new { Produit = x["ctx_name"], Zone = ResolveZone(x) })
                 .Where(g => g.Count() > 1);
 
@@ -622,7 +645,7 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
             }
             #endregion
 
-
+            quoteTemplateList = quoteTemplateList.OrderBy(x => x.GetAttributeValue<string>("ctx_productfamily")).ThenBy(x => x.GetAttributeValue<string>("ctx_name")).ToList();
             foreach (var template in quoteTemplateList)
             {
                 service.Create(template);
@@ -710,6 +733,41 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
                 {
                     log.Trace("Aucun ctx_quotetemplate trouvé pour le quote — produits additionnels ignorés");
                 }
+            }
+            #endregion
+
+            #region 🔹 Produits hors catalogue (isproductoverridden = true) — traités en DERNIER
+            // Après tous les autres produits (catalogue, bundles, produits additionnels).
+            // Un ctx_quotetemplate par ligne hors catalogue, même prix dans toutes les zones, sans contrôle doublon.
+            foreach (var item in writeInItems)
+            {
+                // Nom : productname, sinon productdescription, sinon nom par défaut
+                string writeInName = item.Line.GetAttributeValue<string>("productname");
+                if (string.IsNullOrWhiteSpace(writeInName)) writeInName = item.ProductDescription;
+                if (string.IsNullOrWhiteSpace(writeInName)) writeInName = QuoteTemplateFields.WriteInDefaultName;
+                writeInName = writeInName.Trim();
+
+                if (writeInName.Length > QuoteTemplateFields.NameMaxLength)
+                {
+                    log.Trace($"Hors catalogue : nom tronqué à {QuoteTemplateFields.NameMaxLength} caractères ('{writeInName}')");
+                    writeInName = writeInName.Substring(0, QuoteTemplateFields.NameMaxLength);
+                }
+
+                string price = item.Prix.ToString(); // ctx_unitpriceafterdiscount (0 si NULL)
+
+                var writeInTemplate = new Entity("ctx_quotetemplate");
+                writeInTemplate["ctx_name"] = writeInName;
+                writeInTemplate["ctx_productcountryname"] = writeInName;
+                writeInTemplate["ctx_quoteid"] = new EntityReference("quote", quote.Id);
+                writeInTemplate["ctx_arealocalprice"] = price;
+                //writeInTemplate["ctx_area1price"] = price;
+                //writeInTemplate["ctx_area2price"] = price;
+                //writeInTemplate["ctx_area3price"] = price;
+                //writeInTemplate["ctx_area4price"] = price;
+                //writeInTemplate["ctx_area5price"] = price;
+
+                service.Create(writeInTemplate);
+                log.Trace($"ctx_quotetemplate créé (hors catalogue) : '{writeInName}' — prix={price} (toutes zones)");
             }
             #endregion
 
@@ -1000,6 +1058,11 @@ namespace Centrix.Plugins.BI.Quote.QuoteHandler
     {
         // Nouveau champ texte sur ctx_quotetemplate
         public const string ProductFamily = "ctx_productfamily";
+
+        // Produits hors catalogue : nom par défaut si productname et productdescription sont vides,
+        // et longueur max de ctx_name (⚠️ à aligner sur la longueur réelle du champ dans Dataverse)
+        public const string WriteInDefaultName = "Write-in product";
+        public const int NameMaxLength = 100;
 
         // Champ Choix multiple sur product
         public const string ProductPlatformList = "ctx_platformlist";
